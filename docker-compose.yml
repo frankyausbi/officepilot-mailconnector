@@ -1,0 +1,15 @@
+services:
+  officepilot-mail-collector:
+    build: .
+    restart: unless-stopped
+    environment:
+      OFFICEPILOT_API_BASE: ${OFFICEPILOT_API_BASE:-https://officepilot.sshs1.de}
+      OFFICEPILOT_COLLECTOR_SECRET: ${OFFICEPILOT_COLLECTOR_SECRET}
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      MAX_CONCURRENT_MAILBOXES: ${MAX_CONCURRENT_MAILBOXES:-5}
+      IMAP_CONNECT_TIMEOUT_MS: ${IMAP_CONNECT_TIMEOUT_MS:-20000}
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
