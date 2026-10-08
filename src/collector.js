@@ -9,6 +9,11 @@ const CONCURRENCY=Math.max(1,Number(process.env.MAX_CONCURRENT_MAILBOXES||5));
 const TIMEOUT=Number(process.env.IMAP_CONNECT_TIMEOUT_MS||20000);
 const SMTP_TIMEOUT=Number(process.env.SMTP_CONNECT_TIMEOUT_MS||20000);
 const OUTBOX_LIMIT=Math.max(1,Number(process.env.MAX_CONCURRENT_OUTBOX||3));
+const COLLECTOR_ID=process.env.COLLECTOR_ID||'hostinger-vps-1';
+const VERSION='1.1.1';
+if(!/^[A-Za-z0-9._:-]{1,64}$/.test(COLLECTOR_ID)){ console.error('Invalid COLLECTOR_ID'); process.exit(1); }
+const metrics={active_mailboxes:0,cycles_ok:0,cycles_failed:0,smtp_pending:0};
+let heartbeatBusy=false;
 if(!SECRET){ console.error('OFFICEPILOT_COLLECTOR_SECRET missing'); process.exit(1); }
 let fatal=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -229,6 +234,7 @@ async function runOutbox(){
   try{ data=await api('/api/public/collector/outbox'); }
   catch(e){ log('error','Outbox list failed',{status:e.status,message:safeErr(e)}); return; }
   const jobs=data.jobs||[];
+  metrics.smtp_pending=jobs.length;
   let i=0;
   async function worker(){
     while(i<jobs.length&&!fatal){
@@ -242,9 +248,53 @@ async function runOutbox(){
 
 async function runPool(items){ let i=0; async function worker(){while(i<items.length&&!fatal){const item=items[i++]; await pollMailbox(item);}} await Promise.all(Array.from({length:Math.min(CONCURRENCY,items.length)},worker)); }
 async function cycle(){
-  try{ const data=await api('/api/public/collector/mailboxes'); await runPool(data.mailboxes||[]); await runOutbox(); }
-  catch(e){ log('error','Collector cycle failed',{message:e.message,status:e.status}); }
+  try{
+    const data=await api('/api/public/collector/mailboxes');
+    const boxes=data.mailboxes||[];
+    metrics.active_mailboxes=boxes.length;
+    await runPool(boxes);
+    await runOutbox();
+    metrics.cycles_ok++;
+  }catch(e){
+    metrics.cycles_failed++;
+    log('error','Collector cycle failed',{message:e.message,status:e.status});
+  }
 }
-log('log','OfficePilot Mail Collector started',{base:BASE,intervalSeconds:INTERVAL/1000,imapConcurrency:CONCURRENCY,outboxConcurrency:OUTBOX_LIMIT,version:'1.1.0'});
+
+// Independent of the IMAP/SMTP cycle: a slow mailbox must not suppress heartbeats.
+async function heartbeat(){
+  if(heartbeatBusy || fatal) return;
+  heartbeatBusy=true;
+  try{
+    const payload={
+      collector_id:COLLECTOR_ID,
+      version:VERSION,
+      timestamp:new Date().toISOString(),
+      active_mailboxes:metrics.active_mailboxes,
+      cycles_ok:metrics.cycles_ok,
+      cycles_failed:metrics.cycles_failed,
+      smtp_pending:metrics.smtp_pending
+    };
+    // No long retry loop: the next scheduled heartbeat retries naturally.
+    const res=await fetch(BASE+'/api/public/collector/heartbeat',{
+      method:'POST',
+      headers:{Authorization:`Bearer ${SECRET}`,'Content-Type':'application/json'},
+      body:JSON.stringify(payload),
+      signal:AbortSignal.timeout(15000)
+    });
+    if(res.status===401){
+      log('error','Heartbeat authentication rejected (401)');
+    }else if(!res.ok){
+      log('warn','Heartbeat rejected',{status:res.status});
+    }
+  }catch(e){ log('warn','Heartbeat unavailable',{message:safeErr(e)}); }
+  finally{ heartbeatBusy=false; }
+}
+
+log('log','OfficePilot Mail Collector started',{base:BASE,intervalSeconds:INTERVAL/1000,imapConcurrency:CONCURRENCY,outboxConcurrency:OUTBOX_LIMIT,version:VERSION,collectorId:COLLECTOR_ID});
+// Start immediately, then every 60 seconds; never block mail processing.
+void heartbeat();
+const heartbeatTimer=setInterval(()=>{ void heartbeat(); },60000);
+heartbeatTimer.unref();
 while(!fatal){ await cycle(); if(!fatal) await sleep(INTERVAL); }
 log('error','Collector stopped because authorization failed.'); process.exit(2);
