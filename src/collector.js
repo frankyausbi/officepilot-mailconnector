@@ -1,11 +1,14 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
+import nodemailer from 'nodemailer';
 
 const BASE=(process.env.OFFICEPILOT_API_BASE||'https://officepilot.sshs1.de').replace(/\/$/,'');
 const SECRET=process.env.OFFICEPILOT_COLLECTOR_SECRET;
 const INTERVAL=Math.max(15,Number(process.env.POLL_INTERVAL_SECONDS||60))*1000;
 const CONCURRENCY=Math.max(1,Number(process.env.MAX_CONCURRENT_MAILBOXES||5));
 const TIMEOUT=Number(process.env.IMAP_CONNECT_TIMEOUT_MS||20000);
+const SMTP_TIMEOUT=Number(process.env.SMTP_CONNECT_TIMEOUT_MS||20000);
+const OUTBOX_LIMIT=Math.max(1,Number(process.env.MAX_CONCURRENT_OUTBOX||3));
 if(!SECRET){ console.error('OFFICEPILOT_COLLECTOR_SECRET missing'); process.exit(1); }
 let fatal=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -103,11 +106,145 @@ async function pollMailbox(box){
   }finally{ try{await client.logout();}catch{} }
 }
 
+
+function smtpPermanent(err){
+  const code=Number(err?.responseCode||0);
+  return code>=500 || ['EAUTH','EENVELOPE'].includes(err?.code);
+}
+function safeErr(err){ return String(err?.message||err||'Unknown error').replace(/(pass(word)?|authorization|bearer)\s*[:=]\s*\S+/ig,'$1=[redacted]').slice(0,300); }
+
+async function mailboxCreds(id){
+  return (await api(`/api/public/collector/mailbox/${id}/credentials`,{method:'POST',body:'{}'})).mailbox;
+}
+
+async function alreadyInSent(job){
+  // Best-effort duplicate guard. Some SMTP providers do not automatically save sent mail.
+  try{
+    const creds=await mailboxCreds(job.email_account_id);
+    const sec=creds.imap.security;
+    const client=new ImapFlow({host:creds.imap.host,port:creds.imap.port,secure:sec==='ssl',doSTARTTLS:sec==='starttls',auth:{user:creds.imap.username,pass:creds.imap.password},logger:false,connectionTimeout:TIMEOUT,greetingTimeout:TIMEOUT,socketTimeout:60000});
+    try{
+      await client.connect();
+      const boxes=await client.list();
+      const sent=boxes.find(b=>b.specialUse==='\\Sent') || boxes.find(b=>/sent|gesendet/i.test(b.path));
+      if(!sent) return false;
+      const lock=await client.getMailboxLock(sent.path);
+      try{
+        const hits=await client.search({header:{'message-id':job.message_id}},{uid:true});
+        return Array.isArray(hits) && hits.length>0;
+      } finally { lock.release(); }
+    } finally { try{await client.logout();}catch{} }
+  }catch(e){
+    log('warn','Duplicate check unavailable',{job:job.id,message:safeErr(e)});
+    return false;
+  }
+}
+
+async function markFailed(id,claimToken,err,permanent=false){
+  const responseCode=Number(err?.responseCode||0) || undefined;
+  const payload={
+    claim_token:claimToken,
+    permanent:Boolean(permanent || smtpPermanent(err)),
+    error_code:String(err?.code||'smtp_error').slice(0,100),
+    message:safeErr(err)
+  };
+  if(responseCode) payload.smtp_code=responseCode;
+  try { await api(`/api/public/collector/outbox/${id}/failed`,{method:'POST',body:JSON.stringify(payload)}); }
+  catch(e){ log('error','Failed to report outbound error',{job:id,status:e.status,message:safeErr(e)}); }
+}
+
+async function processOutboxJob(summary){
+  let claim;
+  try{
+    claim=(await api(`/api/public/collector/outbox/${summary.id}/claim`,{method:'POST',body:JSON.stringify({lease_seconds:300})})).job;
+  }catch(e){
+    if(e.status===409 || e.status===404) return;
+    throw e;
+  }
+  const token=claim.claim_token;
+  if(claim.possible_duplicate){
+    if(await alreadyInSent(claim)){
+      log('warn','Possible duplicate found in Sent; confirming without resending',{job:claim.id});
+      try{
+        await api(`/api/public/collector/outbox/${claim.id}/sent`,{method:'POST',body:JSON.stringify({claim_token:token,message_id:claim.message_id,sent_at:new Date().toISOString(),smtp_response:'Recovered from Sent-folder duplicate check'})});
+      }catch(e){ if(e.status!==409) throw e; }
+      return;
+    }
+    // API design says the last uncertain attempt must not be blindly resent.
+    if(Number(claim.attempt)>=Number(claim.max_attempts||3)){
+      await markFailed(claim.id,token,Object.assign(new Error('Previous SMTP attempt could not be confirmed; automatic resend suppressed'),{code:'unconfirmed_previous_attempt'}),true);
+      return;
+    }
+  }
+
+  let c;
+  try{
+    c=await api(`/api/public/collector/outbox/${claim.id}/credentials`,{method:'POST',body:JSON.stringify({claim_token:token})});
+  }catch(e){
+    if(e.status===409 || e.status===404) return;
+    if(e.status===422){ await markFailed(claim.id,token,Object.assign(new Error('SMTP credentials missing or incomplete'),{code:'smtp_credentials_missing'}),true); return; }
+    throw e;
+  }
+
+  const smtp=c.smtp;
+  const transporter=nodemailer.createTransport({
+    host:smtp.host,
+    port:Number(smtp.port),
+    secure:smtp.security==='ssl',
+    requireTLS:smtp.security==='starttls',
+    ignoreTLS:smtp.security==='none',
+    auth:{user:smtp.username,pass:smtp.password},
+    connectionTimeout:SMTP_TIMEOUT,
+    greetingTimeout:SMTP_TIMEOUT,
+    socketTimeout:60000,
+    tls:{serverName:smtp.host}
+  });
+  try{
+    const info=await transporter.sendMail({
+      from:{name:c.from?.name||claim.from_name||'',address:c.from?.email||claim.from_email},
+      to:claim.to_email,
+      subject:claim.subject,
+      text:claim.body_text||undefined,
+      html:claim.body_html||undefined,
+      messageId:claim.message_id,
+      inReplyTo:claim.in_reply_to||undefined,
+      references:Array.isArray(claim.references)?claim.references:undefined
+    });
+    const usedMessageId=info.messageId||claim.message_id;
+    try{
+      await api(`/api/public/collector/outbox/${claim.id}/sent`,{method:'POST',body:JSON.stringify({claim_token:token,message_id:usedMessageId,sent_at:new Date().toISOString(),smtp_response:String(info.response||'').slice(0,300)})});
+      log('log','Outbound message sent',{job:claim.id});
+    }catch(e){
+      // SMTP already accepted the message. Never resend merely because callback failed.
+      log('error','SMTP accepted mail but sent callback failed; job may require duplicate recovery',{job:claim.id,status:e.status,message:safeErr(e)});
+    }
+  }catch(e){
+    log('error','SMTP send failed',{job:claim.id,code:e.code,responseCode:e.responseCode,message:safeErr(e)});
+    await markFailed(claim.id,token,e,false);
+  }finally{ try{transporter.close();}catch{} }
+}
+
+async function runOutbox(){
+  let data;
+  try{ data=await api('/api/public/collector/outbox'); }
+  catch(e){ log('error','Outbox list failed',{status:e.status,message:safeErr(e)}); return; }
+  const jobs=data.jobs||[];
+  let i=0;
+  async function worker(){
+    while(i<jobs.length&&!fatal){
+      const job=jobs[i++];
+      try{ await processOutboxJob(job); }
+      catch(e){ log('error','Outbox job failed',{job:job.id,status:e.status,message:safeErr(e)}); }
+    }
+  }
+  await Promise.all(Array.from({length:Math.min(OUTBOX_LIMIT,jobs.length)},worker));
+}
+
 async function runPool(items){ let i=0; async function worker(){while(i<items.length&&!fatal){const item=items[i++]; await pollMailbox(item);}} await Promise.all(Array.from({length:Math.min(CONCURRENCY,items.length)},worker)); }
 async function cycle(){
-  try{ const data=await api('/api/public/collector/mailboxes'); await runPool(data.mailboxes||[]); }
+  try{ const data=await api('/api/public/collector/mailboxes'); await runPool(data.mailboxes||[]); await runOutbox(); }
   catch(e){ log('error','Collector cycle failed',{message:e.message,status:e.status}); }
 }
-log('log','OfficePilot Mail Collector started',{base:BASE,intervalSeconds:INTERVAL/1000,concurrency:CONCURRENCY});
+log('log','OfficePilot Mail Collector started',{base:BASE,intervalSeconds:INTERVAL/1000,imapConcurrency:CONCURRENCY,outboxConcurrency:OUTBOX_LIMIT,version:'1.1.0'});
 while(!fatal){ await cycle(); if(!fatal) await sleep(INTERVAL); }
 log('error','Collector stopped because authorization failed.'); process.exit(2);

@@ -17,3 +17,7 @@ Copy `.env.example` to `.env` and set the exact same `OFFICEPILOT_COLLECTOR_SECR
 - Sends attachment metadata only, never attachment binary data.
 - Credentials and message bodies are not logged.
 - 401 from OfficePilot stops the collector to avoid repeated requests with a bad secret.
+
+
+## v1.1.0
+Adds OfficePilot outbound SMTP queue processing with claim/sent/failed callbacks, threading headers, retry classification and best-effort duplicate recovery via the IMAP Sent folder. SMTP credentials are fetched only for a claimed job and are never logged.

@@ -1,8 +1,12 @@
 {
   "name": "officepilot-mail-collector",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {"start":"node src/collector.js"},
-  "dependencies": {"imapflow":"^1.0.181","mailparser":"^3.7.4"}
+  "dependencies": {
+    "imapflow":"^1.0.181",
+    "mailparser":"^3.7.4",
+    "nodemailer":"^7.0.6"
+  }
 }
